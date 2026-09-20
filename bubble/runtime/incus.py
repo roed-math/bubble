@@ -154,8 +154,9 @@ class IncusRuntime(ContainerRuntime):
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
-    # The uid/gid bubble's images create their `user` with (useradd on a fresh Ubuntu image).
-    CONTAINER_USER_ID = 1000
+    # Set by launch() when the operator's ids are mapped onto the container user; add_disk then
+    # mounts plainly, because a shifted mount presents host ids unchanged and would undo the map.
+    _idmap_active = False
 
     @staticmethod
     def _subid_allows(path: str, wanted: int) -> bool | None:
@@ -178,9 +179,25 @@ class IncusRuntime(ContainerRuntime):
                 return True
         return False
 
-    def _idmap_config(self) -> tuple[list[str], str]:
-        """`-c raw.idmap=...` mapping the operator's host uid/gid onto the container's `user`,
-        plus a one-line hint when the host does not allow it.
+    def _container_user_ids(self, name: str) -> tuple[int, int] | None:
+        """The uid/gid of the image's `user` account, read from the stopped container's
+        /etc/passwd. Not a constant: on an Ubuntu image the stock `ubuntu` account holds 1000 and
+        `useradd user` lands on 1001."""
+        try:
+            passwd = self._run(["file", "pull", f"{self._q(name)}/etc/passwd", "-"])
+        except IncusError:
+            return None
+        for line in passwd.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 4 and parts[0] == "user":
+                try:
+                    return int(parts[2]), int(parts[3])
+                except ValueError:
+                    return None
+        return None
+
+    def _idmap_for(self, container_uid: int, container_gid: int) -> tuple[str, str]:
+        """(raw.idmap value, hint). Empty value when no mapping is wanted or allowed.
 
         Native Incus gives the container its own id range, so everything bubble hands it from
         the operator's home (the checkout, credential files, the Lake mirrors, a review store)
@@ -192,10 +209,10 @@ class IncusRuntime(ContainerRuntime):
         if self._remote:
             # A configured remote is a VM (Colima on macOS), which maps the operator onto its own
             # user already; the host's ids mean nothing there.
-            return [], ""
+            return "", ""
         uid, gid = os.getuid(), os.getgid()
-        if uid == self.CONTAINER_USER_ID and gid == self.CONTAINER_USER_ID:
-            return [], ""
+        if uid == container_uid and gid == container_gid:
+            return "", ""
         ok_u = self._subid_allows("/etc/subuid", uid)
         ok_g = self._subid_allows("/etc/subgid", gid)
         hint = (
@@ -206,37 +223,42 @@ class IncusRuntime(ContainerRuntime):
             " && sudo systemctl restart incus"
         )
         if ok_u is False or ok_g is False:
-            return [], hint
-        idmap = f"uid {uid} {self.CONTAINER_USER_ID}\ngid {gid} {self.CONTAINER_USER_ID}"
-        return ["-c", f"raw.idmap={idmap}"], hint
+            return "", hint
+        return f"uid {uid} {container_uid}\ngid {gid} {container_gid}", hint
 
     def launch(self, name: str, image: str, **kwargs) -> ContainerInfo:
-        args = ["launch", self._q(image), self._q(name)]
-        idmap, hint = self._idmap_config()
-        if idmap:
-            try:
-                self._run(args + idmap)
-                return self._get_info(name)
-            except IncusError as e:
-                detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
-                if "idmap" not in detail and "subuid" not in detail and "subgid" not in detail:
-                    raise
-                # Incus refused the mapping: the daemon has not been restarted since the subid files
-                # changed, or its allowed ranges differ from them. Say why, then launch unmapped.
-                hint = hint or (
-                    "bubble: Incus refused to map your uid into the container (raw.idmap); "
-                    "if you just added it to /etc/subuid and /etc/subgid, restart the daemon: "
-                    "sudo systemctl restart incus"
-                )
+        """Create the container stopped, map the operator onto its `user` when the host allows,
+        then start it. A refused mapping is reported on stdout and the container starts unmapped."""
+        self._idmap_active = False
+        if self._remote:
+            # A configured remote is a VM (Colima on macOS) that maps the operator onto its own
+            # user already: launch in one step, exactly as before.
+            self._run(["launch", self._q(image), self._q(name)])
+            return self._get_info(name)
+        self._run(["init", self._q(image), self._q(name)])
+        ids = self._container_user_ids(name)
+        if ids is not None:
+            idmap, hint = self._idmap_for(*ids)
+            if idmap:
                 try:
-                    self._run(["delete", "--force", self._q(name)], check=False)
-                except IncusError:
-                    pass
-        if hint:
-            # stdout, like every other bubble progress line: a caller that captures stderr
-            # separately (the TauCeti worker streams only stdout) would otherwise never show it.
-            print(hint, flush=True)
-        self._run(args)
+                    self._run(["config", "set", self._q(name), f"raw.idmap={idmap}"])
+                    self._idmap_active = True
+                except IncusError as e:
+                    detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
+                    if "idmap" not in detail and "subuid" not in detail and "subgid" not in detail:
+                        raise
+                    # Incus refused the mapping: the daemon has not been restarted since the
+                    # subid files changed, or its allowed ranges differ from them.
+                    hint = hint or (
+                        "bubble: Incus refused to map your uid into the container (raw.idmap); "
+                        "if you just added it to /etc/subuid and /etc/subgid, restart the daemon: "
+                        "sudo systemctl restart incus"
+                    )
+            if hint and not self._idmap_active:
+                # stdout, like every other bubble progress line: a caller that captures stderr
+                # separately (the TauCeti worker streams only stdout) would otherwise never show it.
+                print(hint, flush=True)
+        self._run(["start", self._q(name)])
         return self._get_info(name)
 
     @staticmethod
@@ -402,13 +424,15 @@ class IncusRuntime(ContainerRuntime):
         props = {"source": source, "path": path}
         if readonly:
             props["readonly"] = "true"
-        # Native Incus runs the container unprivileged with its own uid map, so a host directory
-        # owned by the operator appears inside as owned by nobody: a writable mount (the review
-        # store) gets "Permission denied" and git refuses a read-only one as "dubious ownership".
-        # `shift=true` asks Incus to idmap the mount into the container's map (idmapped mounts on
-        # kernels >= 5.12, shiftfs before). Colima's VM maps uids itself and has its own runtime,
-        # so this only applies here. Where the host cannot shift, fall back to the plain mount
-        # rather than fail the whole bubble.
+        if self._idmap_active:
+            # The operator is mapped onto the container user (see launch), so a plain mount already
+            # shows their files as the container user's. A shifted mount would present host ids
+            # unchanged and undo that.
+            self.add_device(name, device_name, "disk", **props)
+            return
+        # No mapping (the operator IS the container user, a VM remote, or the host cannot map):
+        # `shift=true` asks Incus to idmap the mount so host ids are at least visible as
+        # themselves rather than as nobody. Fall back to the plain mount where the host cannot.
         try:
             self.add_device(name, device_name, "disk", **props, shift="true")
         except IncusError as e:
