@@ -321,7 +321,20 @@ class IncusRuntime(ContainerRuntime):
         props = {"source": source, "path": path}
         if readonly:
             props["readonly"] = "true"
-        self.add_device(name, device_name, "disk", **props)
+        # Native Incus runs the container unprivileged with its own uid map, so a host directory
+        # owned by the operator appears inside as owned by nobody: a writable mount (the review
+        # store) gets "Permission denied" and git refuses a read-only one as "dubious ownership".
+        # `shift=true` asks Incus to idmap the mount into the container's map (idmapped mounts on
+        # kernels >= 5.12, shiftfs before). Colima's VM maps uids itself and has its own runtime,
+        # so this only applies here. Where the host cannot shift, fall back to the plain mount
+        # rather than fail the whole bubble.
+        try:
+            self.add_device(name, device_name, "disk", **props, shift="true")
+        except IncusError as e:
+            detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
+            if "shift" not in detail and "idmap" not in detail:
+                raise
+            self.add_device(name, device_name, "disk", **props)
 
     def publish(self, name: str, alias: str, *, properties: dict[str, str] | None = None):
         # Stop first if running
