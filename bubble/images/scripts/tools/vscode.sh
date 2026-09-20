@@ -3,6 +3,11 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+# The extension installer below unpacks VSIX files with `unzip`, which the base image does not
+# carry (only the Lean scripts install it, and they run after this one). Install what this
+# script needs itself, the way elan.sh does, so the tool works on a bare base image.
+apt-get update -qq && apt-get install -y -qq python3 unzip < /dev/null
+
 # Pre-install VS Code Server if commit hash was provided at build time
 if [ -n "${VSCODE_COMMIT:-}" ]; then
     echo "Installing VS Code Server (commit: $VSCODE_COMMIT)..."
