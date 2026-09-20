@@ -47,7 +47,7 @@ def test_maps_when_allowed(monkeypatch, tmp_path, capsys):
     launch = [c for c in rt.calls if c[0] == "launch"]
     assert len(launch) == 1
     assert launch[0][-2:] == ["-c", "raw.idmap=uid 1005 1000\ngid 1005 1000"]
-    assert "cannot own" not in capsys.readouterr().err
+    assert "cannot own" not in capsys.readouterr().out
 
 
 def test_hint_and_unmapped_when_not_allowed(monkeypatch, tmp_path, capsys):
@@ -56,8 +56,8 @@ def test_hint_and_unmapped_when_not_allowed(monkeypatch, tmp_path, capsys):
     rt.launch("c", "img")
     launch = [c for c in rt.calls if c[0] == "launch"]
     assert launch == [["launch", "img", "c"]]
-    err = capsys.readouterr().err
-    assert "root:1005:1" in err and "/etc/subuid" in err
+    out = capsys.readouterr().out
+    assert "root:1005:1" in out and "/etc/subuid" in out
 
 
 def test_relaunches_unmapped_when_incus_refuses(monkeypatch, tmp_path, capsys):
@@ -67,7 +67,7 @@ def test_relaunches_unmapped_when_incus_refuses(monkeypatch, tmp_path, capsys):
     kinds = [c[0] for c in rt.calls]
     assert kinds == ["launch", "delete", "launch"]
     assert not any(a.startswith("raw.idmap=") for a in rt.calls[-1])
-    assert "cannot own" in capsys.readouterr().err
+    assert "restart" in capsys.readouterr().out or "cannot own" in capsys.readouterr().out
 
 
 def test_no_mapping_when_uid_is_already_the_container_user(monkeypatch, tmp_path):

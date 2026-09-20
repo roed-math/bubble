@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -220,14 +219,20 @@ class IncusRuntime(ContainerRuntime):
                 detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
                 if "idmap" not in detail and "subuid" not in detail and "subgid" not in detail:
                     raise
-                # Incus refused the mapping (the daemon's allowed ranges differ from what the files
-                # said, or the container was left half-created): say why, then launch unmapped.
+                # Incus refused the mapping: the daemon has not been restarted since the subid files
+                # changed, or its allowed ranges differ from them. Say why, then launch unmapped.
+                hint = hint or (
+                    "bubble: Incus refused to map your uid into the container (raw.idmap); if you just added it to "
+                    "/etc/subuid and /etc/subgid, restart the daemon: sudo systemctl restart incus"
+                )
                 try:
                     self._run(["delete", "--force", self._q(name)], check=False)
                 except IncusError:
                     pass
         if hint:
-            print(hint, file=sys.stderr)
+            # stdout, like every other bubble progress line: callers that capture stderr separately
+            # (the TauCeti worker streams only stdout into its round log) would otherwise never show it.
+            print(hint, flush=True)
         self._run(args)
         return self._get_info(name)
 
