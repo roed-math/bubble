@@ -159,8 +159,8 @@ class IncusRuntime(ContainerRuntime):
 
     @staticmethod
     def _subid_allows(path: str, wanted: int) -> bool | None:
-        """Whether /etc/subuid (or subgid) lets the Incus daemon (root) use `wanted`. None when the
-        file cannot be read, which is not a refusal: some hosts do not use the files at all."""
+        """Whether /etc/subuid (or subgid) lets the Incus daemon (root) use `wanted`. None when
+        the file cannot be read, which is not a refusal: some hosts do not use the files."""
         try:
             with open(path) as f:
                 lines = f.read().splitlines()
@@ -179,15 +179,16 @@ class IncusRuntime(ContainerRuntime):
         return False
 
     def _idmap_config(self) -> tuple[list[str], str]:
-        """`-c raw.idmap=...` mapping the operator's host uid/gid onto the container's `user`, plus a
-        one-line hint when the host does not allow it.
+        """`-c raw.idmap=...` mapping the operator's host uid/gid onto the container's `user`,
+        plus a one-line hint when the host does not allow it.
 
-        Native Incus gives the container its own id range, so everything bubble hands it from the
-        operator's home (the checkout, credential files, the Lake mirrors, a review store) arrives
-        owned by somebody else: writes fail, git calls the mirrors "dubious". Colima maps the operator
-        onto the VM's user, which is what makes those mounts just work on macOS. raw.idmap is the same
-        mapping on the host, but Incus honours it only for ids listed for root in /etc/subuid and
-        /etc/subgid, so check first and tell the operator the two lines to add when they are missing."""
+        Native Incus gives the container its own id range, so everything bubble hands it from
+        the operator's home (the checkout, credential files, the Lake mirrors, a review store)
+        arrives owned by somebody else: writes fail, git calls the mirrors "dubious". Colima maps
+        the operator onto the VM's user, which is what makes those mounts just work on macOS.
+        raw.idmap is the same mapping on the host, but Incus honours it only for ids listed for
+        root in /etc/subuid and /etc/subgid, so check first and tell the operator the two lines
+        to add when they are missing."""
         if self._remote:
             # A configured remote is a VM (Colima on macOS), which maps the operator onto its own
             # user already; the host's ids mean nothing there.
@@ -198,10 +199,11 @@ class IncusRuntime(ContainerRuntime):
         ok_u = self._subid_allows("/etc/subuid", uid)
         ok_g = self._subid_allows("/etc/subgid", gid)
         hint = (
-            f"bubble: the container's user cannot own files you mount in (host uid {uid} is not mapped). "
-            f"Allow Incus to map it and restart the daemon:\n"
-            f"  echo 'root:{uid}:1' | sudo tee -a /etc/subuid && echo 'root:{gid}:1' | sudo tee -a /etc/subgid "
-            f"&& sudo systemctl restart incus"
+            "bubble: the container's user cannot own files you mount in "
+            f"(host uid {uid} is not mapped). Allow Incus to map it and restart the daemon:\n"
+            f"  echo 'root:{uid}:1' | sudo tee -a /etc/subuid"
+            f" && echo 'root:{gid}:1' | sudo tee -a /etc/subgid"
+            " && sudo systemctl restart incus"
         )
         if ok_u is False or ok_g is False:
             return [], hint
@@ -222,16 +224,17 @@ class IncusRuntime(ContainerRuntime):
                 # Incus refused the mapping: the daemon has not been restarted since the subid files
                 # changed, or its allowed ranges differ from them. Say why, then launch unmapped.
                 hint = hint or (
-                    "bubble: Incus refused to map your uid into the container (raw.idmap); if you just added it to "
-                    "/etc/subuid and /etc/subgid, restart the daemon: sudo systemctl restart incus"
+                    "bubble: Incus refused to map your uid into the container (raw.idmap); "
+                    "if you just added it to /etc/subuid and /etc/subgid, restart the daemon: "
+                    "sudo systemctl restart incus"
                 )
                 try:
                     self._run(["delete", "--force", self._q(name)], check=False)
                 except IncusError:
                     pass
         if hint:
-            # stdout, like every other bubble progress line: callers that capture stderr separately
-            # (the TauCeti worker streams only stdout into its round log) would otherwise never show it.
+            # stdout, like every other bubble progress line: a caller that captures stderr
+            # separately (the TauCeti worker streams only stdout) would otherwise never show it.
             print(hint, flush=True)
         self._run(args)
         return self._get_info(name)
