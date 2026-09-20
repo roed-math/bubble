@@ -2,10 +2,6 @@
 /etc/subuid and /etc/subgid allow it, with a hint and an unmapped launch otherwise, and an unmapped
 relaunch when Incus itself refuses the mapping."""
 
-import subprocess
-
-import pytest
-
 from bubble.runtime import incus as I
 
 
@@ -17,8 +13,14 @@ class FakeRuntime(I.IncusRuntime):
 
     def _run(self, args, check=True, capture=True):
         self.calls.append(list(args))
-        if args[0] == "launch" and self.refuse_idmap and any(a.startswith("raw.idmap=") for a in args):
-            raise I.IncusError(1, ["incus", *args], "", "Error: Invalid idmap: uid not allowed by subuid")
+        if (
+            args[0] == "launch"
+            and self.refuse_idmap
+            and any(a.startswith("raw.idmap=") for a in args)
+        ):
+            raise I.IncusError(
+                1, ["incus", *args], "", "Error: Invalid idmap: uid not allowed by subuid"
+            )
         return ""
 
     def _get_info(self, name):
@@ -78,7 +80,9 @@ def test_no_mapping_when_uid_is_already_the_container_user(monkeypatch, tmp_path
 
 
 def test_subid_parser():
-    import tempfile, os
+    import os
+    import tempfile
+
     with tempfile.NamedTemporaryFile("w", delete=False) as f:
         f.write("# comment\nroot:100000:65536\nalice:200000:65536\n0:1005:1\n")
     try:
@@ -95,5 +99,8 @@ def test_no_mapping_on_a_configured_remote(monkeypatch, tmp_path):
     rt = FakeRuntime()
     rt._remote = "bubble-colima"
     rt.launch("c", "img")
-    assert rt.calls == [["launch", "bubble-colima:img", "bubble-colima:c"]] or rt.calls[0][0] == "launch"
+    assert (
+        rt.calls == [["launch", "bubble-colima:img", "bubble-colima:c"]]
+        or rt.calls[0][0] == "launch"
+    )
     assert not any(a.startswith("raw.idmap=") for c in rt.calls for a in c)
