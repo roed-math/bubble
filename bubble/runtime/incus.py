@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -153,8 +155,75 @@ class IncusRuntime(ContainerRuntime):
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
+    # The uid/gid bubble's images create their `user` with (useradd on a fresh Ubuntu image).
+    CONTAINER_USER_ID = 1000
+
+    @staticmethod
+    def _subid_allows(path: str, wanted: int) -> bool | None:
+        """Whether /etc/subuid (or subgid) lets the Incus daemon (root) use `wanted`. None when the
+        file cannot be read, which is not a refusal: some hosts do not use the files at all."""
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            parts = line.strip().split(":")
+            if len(parts) != 3 or parts[0] not in ("root", "0"):
+                continue
+            try:
+                start, count = int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            if start <= wanted < start + count:
+                return True
+        return False
+
+    def _idmap_config(self) -> tuple[list[str], str]:
+        """`-c raw.idmap=...` mapping the operator's host uid/gid onto the container's `user`, plus a
+        one-line hint when the host does not allow it.
+
+        Native Incus gives the container its own id range, so everything bubble hands it from the
+        operator's home (the checkout, credential files, the Lake mirrors, a review store) arrives
+        owned by somebody else: writes fail, git calls the mirrors "dubious". Colima maps the operator
+        onto the VM's user, which is what makes those mounts just work on macOS. raw.idmap is the same
+        mapping on the host, but Incus honours it only for ids listed for root in /etc/subuid and
+        /etc/subgid, so check first and tell the operator the two lines to add when they are missing."""
+        uid, gid = os.getuid(), os.getgid()
+        if uid == self.CONTAINER_USER_ID and gid == self.CONTAINER_USER_ID:
+            return [], ""
+        ok_u = self._subid_allows("/etc/subuid", uid)
+        ok_g = self._subid_allows("/etc/subgid", gid)
+        hint = (
+            f"bubble: the container's user cannot own files you mount in (host uid {uid} is not mapped). "
+            f"Allow Incus to map it and restart the daemon:\n"
+            f"  echo 'root:{uid}:1' | sudo tee -a /etc/subuid && echo 'root:{gid}:1' | sudo tee -a /etc/subgid "
+            f"&& sudo systemctl restart incus"
+        )
+        if ok_u is False or ok_g is False:
+            return [], hint
+        idmap = f"uid {uid} {self.CONTAINER_USER_ID}\ngid {gid} {self.CONTAINER_USER_ID}"
+        return ["-c", f"raw.idmap={idmap}"], hint
+
     def launch(self, name: str, image: str, **kwargs) -> ContainerInfo:
         args = ["launch", self._q(image), self._q(name)]
+        idmap, hint = self._idmap_config()
+        if idmap:
+            try:
+                self._run(args + idmap)
+                return self._get_info(name)
+            except IncusError as e:
+                detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
+                if "idmap" not in detail and "subuid" not in detail and "subgid" not in detail:
+                    raise
+                # Incus refused the mapping (the daemon's allowed ranges differ from what the files
+                # said, or the container was left half-created): say why, then launch unmapped.
+                try:
+                    self._run(["delete", "--force", self._q(name)], check=False)
+                except IncusError:
+                    pass
+        if hint:
+            print(hint, file=sys.stderr)
         self._run(args)
         return self._get_info(name)
 
