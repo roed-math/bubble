@@ -189,6 +189,10 @@ class IncusRuntime(ContainerRuntime):
         onto the VM's user, which is what makes those mounts just work on macOS. raw.idmap is the same
         mapping on the host, but Incus honours it only for ids listed for root in /etc/subuid and
         /etc/subgid, so check first and tell the operator the two lines to add when they are missing."""
+        if self._remote:
+            # A configured remote is a VM (Colima on macOS), which maps the operator onto its own
+            # user already; the host's ids mean nothing there.
+            return [], ""
         uid, gid = os.getuid(), os.getgid()
         if uid == self.CONTAINER_USER_ID and gid == self.CONTAINER_USER_ID:
             return [], ""

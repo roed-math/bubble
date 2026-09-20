@@ -88,3 +88,12 @@ def test_subid_parser():
         assert I.IncusRuntime._subid_allows("/nonexistent/subuid", 1) is None
     finally:
         os.unlink(f.name)
+
+
+def test_no_mapping_on_a_configured_remote(monkeypatch, tmp_path):
+    _subid(monkeypatch, tmp_path, True, True)
+    rt = FakeRuntime()
+    rt._remote = "bubble-colima"
+    rt.launch("c", "img")
+    assert rt.calls == [["launch", "bubble-colima:img", "bubble-colima:c"]] or rt.calls[0][0] == "launch"
+    assert not any(a.startswith("raw.idmap=") for c in rt.calls for a in c)
