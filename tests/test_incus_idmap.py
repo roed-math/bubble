@@ -107,7 +107,7 @@ def _disk_adds(rt):
     return [c for c in rt.calls if c[:3] == ["config", "device", "add"]]
 
 
-# ---- mapping policy -------------------------------------------------------------------------------
+# ---- mapping policy
 
 
 def test_maps_onto_the_real_container_user_when_allowed(monkeypatch, tmp_path, capsys):
@@ -180,7 +180,7 @@ def test_unrelated_config_error_propagates_and_nothing_is_deleted(monkeypatch, t
     assert not any(c[0] == "delete" for c in rt.calls)
 
 
-# ---- existing configuration ---------------------------------------------------------------------
+# ---- existing configuration
 
 
 def test_profile_idmap_is_preserved_and_extended(monkeypatch, tmp_path):
@@ -206,7 +206,7 @@ def test_merge_idmap_keeps_unrelated_lines():
     assert m("uid 1 7", "uid 1 2\ngid 1 2") == "uid 1 7\ngid 1 2"  # an operator's uid line wins
 
 
-# ---- server scope ---------------------------------------------------------------------------------
+# ---- server scope
 
 
 def test_no_mapping_on_a_configured_remote(monkeypatch, tmp_path):
@@ -245,7 +245,7 @@ def test_named_default_remote_that_is_local_maps(monkeypatch, tmp_path):
     assert _idmap_set(rt) == ["uid 1005 1001\ngid 1005 1001"]
 
 
-# ---- disk arguments and the mapping actually in force ---------------------------------------------
+# ---- disk arguments and the mapping actually in force
 
 
 def test_mapped_container_mounts_plainly_ro_and_rw(monkeypatch, tmp_path):
@@ -294,7 +294,7 @@ def test_two_containers_keep_separate_mapping_state(monkeypatch, tmp_path):
     assert adds[1][3] == "unmapped" and adds[1][-1] == "shift=true"
 
 
-# ---- shifting unsupported, and unrelated disk errors ------------------------------------------------
+# ---- shifting unsupported, and unrelated disk errors
 
 
 def _err(text, *, stdout=False):
@@ -339,13 +339,14 @@ def test_unrelated_disk_errors_propagate_even_when_names_mention_shift_or_idmap(
         assert len(_disk_adds(rt)) == 1  # no retry
 
 
-# ---- subordinate-id parsing -------------------------------------------------------------------------
+# ---- subordinate-id parsing
 
 
 def test_subid_parser(tmp_path):
     f = tmp_path / "subuid"
     f.write_text(
-        "# comment\n\nroot:100000:65536\nalice:200000:65536\n0:1005:1\nmalformed line\nroot:x:y\nroot:300000\n"
+        "# comment\n\nroot:100000:65536\nalice:200000:65536\n0:1005:1\n"
+        "malformed line\nroot:x:y\nroot:300000\n"
     )
     allows = I.IncusRuntime._subid_allows
     assert allows(str(f), 1005) is True  # numeric root name
