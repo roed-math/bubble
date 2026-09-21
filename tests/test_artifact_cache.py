@@ -496,3 +496,51 @@ def test_installed_daemon_health_is_retried_before_restart(monkeypatch):
 
     assert artifact_cache.ensure_daemon_endpoint() == endpoint
     assert installs == []
+
+
+def test_bounded_mixin_releases_slots_over_threaded_http_server():
+    """Every accepted connection must hand its slot back whichever base server the mixin sits on.
+
+    Regression: over ``auth_proxy.ThreadedHTTPServer`` (the Linux daemon's base through
+    ``BridgeBoundHTTPServer``) the slot was released only from ``process_request_thread``, which that
+    base never calls, so the accept loop wedged after 256 connections."""
+    import socket
+    from http.server import BaseHTTPRequestHandler
+
+    from bubble.auth_proxy import ThreadedHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    class Server(artifact_cache._BoundedServerMixin, ThreadedHTTPServer):
+        _request_slots = threading.BoundedSemaphore(4)  # small, so exhaustion is quick to reach
+
+    server = Server(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    answered = 0
+    try:
+        for _ in range(12):  # three times the slot count: a leak wedges the accept loop at the fifth
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                if b" 200 " in conn.recv(256):
+                    answered += 1
+        assert answered == 12
+        # Every slot is back: acquiring all of them must not block.
+        for _ in range(4):
+            assert server._request_slots.acquire(timeout=5)
+    finally:
+        if answered == 12:
+            # A wedged accept loop never reads the shutdown flag, so only a healthy server is stopped
+            # this way; a wedged one is a daemon thread and dies with the test process.
+            server.shutdown()
+        server.server_close()
