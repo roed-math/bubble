@@ -208,7 +208,7 @@ finally:
 def run_helper(
     script_text: str, tmp_path: Path, bin_dir: Path, ext_id="leanprover.lean4", version="0.0.9"
 ):
-    """Run the real helper (EXTENSIONS_DIR redirected to tmp_path) with PATH holding only bin_dir."""
+    """Run the real helper (EXTENSIONS_DIR redirected under tmp_path); PATH holds only bin_dir."""
     ext_root = tmp_path / "extensions"
     src = helper_source(script_text)
     assert 'EXTENSIONS_DIR = "/home/user/.vscode-server/extensions"' in src
@@ -285,7 +285,7 @@ class TestExtensionInstallNeedsUnzipFromTheScript:
         assert manifest[0]["relativeLocation"] == "leanprover.lean4-0.0.9"
 
     def test_helper_fails_without_unzip(self, tmp_path):
-        """The bug this PR fixes, reproduced: the same helper on a PATH with no unzip cannot install."""
+        """The bug this PR fixes, reproduced: the same helper with no unzip on PATH cannot install."""
         bin_dir = make_bin(tmp_path)
         proc, calls, ext_root = run_helper(SCRIPT, tmp_path, bin_dir)
         assert proc.returncode != 0
