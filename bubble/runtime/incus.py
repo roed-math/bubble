@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -154,9 +155,43 @@ class IncusRuntime(ContainerRuntime):
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
 
-    # Set by launch() when the operator's ids are mapped onto the container user; add_disk then
-    # mounts plainly, because a shifted mount presents host ids unchanged and would undo the map.
-    _idmap_active = False
+    # Per container: whether the operator's ids are mapped onto its `user` (set by launch(), read
+    # back from the instance config for containers this runtime did not launch). add_disk mounts
+    # a mapped container's disks plainly: a shifted mount presents host ids unchanged and would undo
+    # the map (measured on Incus 7.4 / kernel 7.1: under `uid 1005 1001` a plain mount of a
+    # 1005-owned 0600 file reads and writes as `user`; the same directory shifted is 1005 inside
+    # and denied). Not one flag for the whole runtime: several containers, and other runtime
+    # instances (a refresh after restart), must each see the mapping actually in force.
+    _mapped: dict[str, bool]
+    _daemon_local: bool | None = None
+
+    def _mapping_in_force(self, name: str) -> bool:
+        """Is `raw.idmap` set on this instance (by us or by anyone)? Cached per name."""
+        cache = self.__dict__.setdefault("_mapped", {})
+        if name not in cache:
+            try:
+                cache[name] = bool(self._run(["config", "get", self._q(name), "raw.idmap"]).strip())
+            except IncusError:
+                cache[name] = False
+        return cache[name]
+
+    def _is_local_daemon(self) -> bool:
+        """Whether the daemon our unqualified names reach is the host's own (a unix socket).
+        A configured remote is by definition not; an empty remote means the client's default
+        remote, which is only local when its address is a unix socket. Host uids, subuid files
+        and the operator's identity mean nothing on any other server. Cached."""
+        if self._remote:
+            return False
+        if self._daemon_local is None:
+            try:
+                default = self._run(["remote", "get-default"]).strip()
+                remotes = json.loads(self._run(["remote", "list", "--format", "json"]) or "{}")
+                entry = remotes.get(default) or {}
+                addrs = entry.get("Addrs") or [entry.get("Addr") or ""]  # Incus 7 lists `Addrs`
+                self._daemon_local = any(str(a).startswith("unix:") for a in addrs)
+            except (IncusError, ValueError):
+                self._daemon_local = False
+        return self._daemon_local
 
     @staticmethod
     def _subid_allows(path: str, wanted: int) -> bool | None:
@@ -197,43 +232,79 @@ class IncusRuntime(ContainerRuntime):
         return None
 
     def _idmap_for(self, container_uid: int, container_gid: int) -> tuple[str, str]:
-        """(raw.idmap value, hint). Empty value when no mapping is wanted or allowed.
+        """(raw.idmap lines, hint). Empty value when no mapping is wanted or allowed.
 
         Native Incus gives the container its own id range, so everything bubble hands it from
         the operator's home (the checkout, credential files, the Lake mirrors, a review store)
         arrives owned by somebody else: writes fail, git calls the mirrors "dubious". Colima maps
         the operator onto the VM's user, which is what makes those mounts just work on macOS.
         raw.idmap is the same mapping on the host, but Incus honours it only for ids listed for
-        root in /etc/subuid and /etc/subgid, so check first and tell the operator the two lines
-        to add when they are missing."""
-        if self._remote:
-            # A configured remote is a VM (Colima on macOS), which maps the operator onto its own
-            # user already; the host's ids mean nothing there.
+        root in /etc/subuid and /etc/subgid, so check first and tell the operator the lines to
+        add when they are missing. The uid and the gid are handled separately: only the id that
+        differs is mapped, and only its subordinate file has to allow it (an operator whose primary
+        group already matches the container user's must not be refused over an unneeded gid map)."""
+        if not self._is_local_daemon():
             return "", ""
         uid, gid = os.getuid(), os.getgid()
-        if uid == container_uid and gid == container_gid:
+        wanted = []
+        if uid != container_uid:
+            wanted.append(("uid", uid, container_uid, "/etc/subuid"))
+        if gid != container_gid:
+            wanted.append(("gid", gid, container_gid, "/etc/subgid"))
+        if not wanted:
             return "", ""
-        ok_u = self._subid_allows("/etc/subuid", uid)
-        ok_g = self._subid_allows("/etc/subgid", gid)
+        adds = " && ".join(
+            f"echo 'root:{host}:1' | sudo tee -a {path}" for _, host, _, path in wanted
+        )
         hint = (
             "bubble: the container's user cannot own files you mount in "
-            f"(host uid {uid} is not mapped). Allow Incus to map it and restart the daemon:\n"
-            f"  echo 'root:{uid}:1' | sudo tee -a /etc/subuid"
-            f" && echo 'root:{gid}:1' | sudo tee -a /etc/subgid"
-            " && sudo systemctl restart incus"
+            f"(host {' and '.join(f'{k} {host}' for k, host, _, _ in wanted)} not mapped). "
+            f"Allow Incus to map it and restart the daemon:\n  {adds} && sudo systemctl restart incus"
         )
-        if ok_u is False or ok_g is False:
+        if any(self._subid_allows(path, host) is False for _, host, _, path in wanted):
             return "", hint
-        return f"uid {uid} {container_uid}\ngid {gid} {container_gid}", hint
+        return "\n".join(f"{k} {host} {ctr}" for k, host, ctr, _ in wanted), hint
+
+    @staticmethod
+    def _merge_idmap(existing: str, lines: str) -> str:
+        """Add our lines to an instance's effective raw.idmap (its own or a profile's) instead of
+        replacing it: an operator's policy survives, and a line already covering one of our host
+        ids is left alone."""
+        kept = [ln.strip() for ln in (existing or "").splitlines() if ln.strip()]
+        covered = {(ln.split()[0], ln.split()[1]) for ln in kept if len(ln.split()) >= 2}
+        for ln in lines.splitlines():
+            parts = ln.split()
+            if len(parts) >= 2 and (parts[0], parts[1]) not in covered:
+                kept.append(ln)
+        return "\n".join(kept)
+
+    # What Incus says when it will not apply a raw.idmap: the id is outside root's subordinate
+    # ranges, or the map is malformed. Matched against the command's OUTPUT only (never its argv,
+    # which itself contains "raw.idmap"), so an instance whose NAME contains "idmap" cannot trip it.
+    _IDMAP_REFUSED_RE = re.compile(
+        r"invalid idmap|not allowed by sub[ug]id|idmap.*(not allowed|not permitted|out of range)",
+        re.IGNORECASE,
+    )
+    # What Incus says when a disk cannot be shifted on this pool/kernel. Same rule: output only.
+    _SHIFT_UNSUPPORTED_RE = re.compile(
+        r"(idmapped mounts?|shift(ing)?)[^\n]*(not supported|unsupported|not available)"
+        r"|(not supported|unsupported)[^\n]*(shift|idmapped mounts?)",
+        re.IGNORECASE,
+    )
 
     def launch(self, name: str, image: str, **kwargs) -> ContainerInfo:
         """Create the container stopped, map the operator onto its `user` when the host allows,
-        then start it. A refused mapping is reported on stdout and the container starts unmapped."""
-        self._idmap_active = False
-        if self._remote:
-            # A configured remote is a VM (Colima on macOS) that maps the operator onto its own
-            # user already: launch in one step, exactly as before.
+        then start it. A refused mapping is reported on stdout and the container starts unmapped.
+        Nothing here deletes an instance: a failure after `init` leaves the stopped container for
+        the caller's cleanup, and a failed mapping is reported, never retried destructively."""
+        mapped = self.__dict__.setdefault("_mapped", {})
+        mapped.pop(name, None)
+        if not self._is_local_daemon():
+            # A configured remote (Colima on macOS) or a non-local default remote maps the
+            # operator onto its own user already, or is not ours to reason about: launch in one
+            # step, exactly as before this mapping existed.
             self._run(["launch", self._q(image), self._q(name)])
+            mapped[name] = False
             return self._get_info(name)
         self._run(["init", self._q(image), self._q(name)])
         ids = self._container_user_ids(name)
@@ -241,23 +312,32 @@ class IncusRuntime(ContainerRuntime):
             idmap, hint = self._idmap_for(*ids)
             if idmap:
                 try:
-                    self._run(["config", "set", self._q(name), f"raw.idmap={idmap}"])
-                    self._idmap_active = True
-                except IncusError as e:
-                    detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
-                    if "idmap" not in detail and "subuid" not in detail and "subgid" not in detail:
-                        raise
-                    # Incus refused the mapping: the daemon has not been restarted since the
-                    # subid files changed, or its allowed ranges differ from them.
-                    hint = hint or (
-                        "bubble: Incus refused to map your uid into the container (raw.idmap); "
-                        "if you just added it to /etc/subuid and /etc/subgid, restart the daemon: "
-                        "sudo systemctl restart incus"
-                    )
-            if hint and not self._idmap_active:
+                    existing = self._run(["config", "get", "-e", self._q(name), "raw.idmap"])
+                except IncusError:
+                    existing = ""
+                merged = self._merge_idmap(existing, idmap)
+                if merged.strip() == (existing or "").strip():
+                    mapped[name] = True  # a profile or the operator already maps these ids
+                else:
+                    try:
+                        self._run(["config", "set", self._q(name), f"raw.idmap={merged}"])
+                        mapped[name] = True
+                    except IncusError as e:
+                        detail = f"{e.output or ''}\n{e.stderr or ''}"
+                        if not self._IDMAP_REFUSED_RE.search(detail):
+                            raise
+                        # Incus refused the mapping: the daemon has not been restarted since the
+                        # subid files changed, or its allowed ranges differ from them.
+                        hint = hint or (
+                            "bubble: Incus refused to map your uid into the container (raw.idmap); "
+                            "if you just added it to /etc/subuid and /etc/subgid, restart the "
+                            "daemon: sudo systemctl restart incus"
+                        )
+            if hint and not mapped.get(name):
                 # stdout, like every other bubble progress line: a caller that captures stderr
                 # separately (the TauCeti worker streams only stdout) would otherwise never show it.
                 print(hint, flush=True)
+        mapped.setdefault(name, False)
         self._run(["start", self._q(name)])
         return self._get_info(name)
 
@@ -424,21 +504,33 @@ class IncusRuntime(ContainerRuntime):
         props = {"source": source, "path": path}
         if readonly:
             props["readonly"] = "true"
-        if self._idmap_active:
+        if not self._is_local_daemon():
+            # A VM remote (Colima) maps the operator onto its user itself: the plain mount that
+            # always worked there. No shifting: it would present the host's ids and undo that map.
+            self.add_device(name, device_name, "disk", **props)
+            return
+        if self._mapping_in_force(name):
             # The operator is mapped onto the container user (see launch), so a plain mount already
             # shows their files as the container user's. A shifted mount would present host ids
             # unchanged and undo that.
             self.add_device(name, device_name, "disk", **props)
             return
-        # No mapping (the operator IS the container user, a VM remote, or the host cannot map):
-        # `shift=true` asks Incus to idmap the mount so host ids are at least visible as
-        # themselves rather than as nobody. Fall back to the plain mount where the host cannot.
+        # No mapping (the operator IS the container user, or the host cannot map): `shift=true`
+        # asks Incus to idmap the mount so host ids are at least visible as themselves rather than
+        # as nobody. One fallback to the plain mount, only when Incus says shifting is unsupported
+        # here; anything else (a missing source, a permission fault) is the caller's error.
         try:
             self.add_device(name, device_name, "disk", **props, shift="true")
         except IncusError as e:
-            detail = f"{e.output or ''}\n{e.stderr or ''}".lower()
-            if "shift" not in detail and "idmap" not in detail:
+            detail = f"{e.output or ''}\n{e.stderr or ''}"
+            if not self._SHIFT_UNSUPPORTED_RE.search(detail):
                 raise
+            print(
+                f"bubble: warning: Incus cannot shift the mount {device_name} ({source} -> {path}) on "
+                "this host; mounting it plainly. Files owned by you will belong to nobody inside the "
+                "container, so a credential or a writable store on this mount may be unusable.",
+                flush=True,
+            )
             self.add_device(name, device_name, "disk", **props)
 
     def publish(self, name: str, alias: str, *, properties: dict[str, str] | None = None):
