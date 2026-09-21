@@ -611,7 +611,7 @@ class _RecordingServer(artifact_cache._BoundedServerMixin):
 
 
 class TestBoundedRequestThreadPermits:
-    """The permit is returned exactly once on every path out of the worker, and on a failed spawn."""
+    """The permit comes back exactly once on every path out of the worker, and on a failed spawn."""
 
     def _run(self, **faults):
         srv = _RecordingServer(**faults)
