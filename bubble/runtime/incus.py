@@ -259,7 +259,8 @@ class IncusRuntime(ContainerRuntime):
         hint = (
             "bubble: the container's user cannot own files you mount in "
             f"(host {' and '.join(f'{k} {host}' for k, host, _, _ in wanted)} not mapped). "
-            f"Allow Incus to map it and restart the daemon:\n  {adds} && sudo systemctl restart incus"
+            "Allow Incus to map it and restart the daemon:\n"
+            f"  {adds} && sudo systemctl restart incus"
         )
         if any(self._subid_allows(path, host) is False for _, host, _, path in wanted):
             return "", hint
@@ -526,8 +527,9 @@ class IncusRuntime(ContainerRuntime):
             if not self._SHIFT_UNSUPPORTED_RE.search(detail):
                 raise
             print(
-                f"bubble: warning: Incus cannot shift the mount {device_name} ({source} -> {path}) on "
-                "this host; mounting it plainly. Files owned by you will belong to nobody inside the "
+                f"bubble: warning: Incus cannot shift the mount {device_name} "
+                f"({source} -> {path}) on this host; mounting it plainly. Files owned by you "
+                "will belong to nobody inside the "
                 "container, so a credential or a writable store on this mount may be unusable.",
                 flush=True,
             )
