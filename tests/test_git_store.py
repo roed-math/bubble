@@ -330,3 +330,45 @@ def test_repo_is_known_finds_verified_legacy_mirror(tmp_data_dir):
         check=True,
     )
     assert git_store.repo_is_known("owner/demo")
+
+
+def _git(*args, cwd=None):
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_fetch_pr_head_branch_writes_the_pull_ref(tmp_data_dir, tmp_path):
+    fork = tmp_path / "fork"
+    _git("init", "-q", "-b", "feature", str(fork))
+    _git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+        cwd=fork,
+    )
+    head = _git("rev-parse", "HEAD", cwd=fork)
+    mirror = bare_repo_path("owner/repo")
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", "--bare", str(mirror))
+
+    git_store.fetch_pr_head_branch("owner/repo", "7", str(fork), "feature")
+
+    assert _git("-C", str(mirror), "rev-parse", "refs/pull/7/head") == head
+
+
+def test_fetch_pr_head_branch_raises_for_a_missing_branch(tmp_data_dir, tmp_path):
+    fork = tmp_path / "fork"
+    _git("init", "-q", "-b", "feature", str(fork))
+    mirror = bare_repo_path("owner/repo")
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", "--bare", str(mirror))
+
+    with pytest.raises(subprocess.CalledProcessError):
+        git_store.fetch_pr_head_branch("owner/repo", "7", str(fork), "gone")

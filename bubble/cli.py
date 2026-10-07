@@ -36,6 +36,7 @@ from .finalization import (
 )
 from .git_store import (
     ensure_rev_available,
+    fetch_pr_head_branch,
     fetch_ref,
     find_existing_mirror,
     init_bare_repo,
@@ -209,6 +210,24 @@ def _generate_bubble_name(t, custom_name: str | None) -> str:
     return generate_name(t.short_name, "main", "")
 
 
+def _fetch_pr_head_branch(t) -> bool:
+    """Stand in for a missing ``refs/pull/N/head`` with the PR's head branch. True on success.
+
+    Toolchain and Lake-dependency detection read that ref. Without it a Lean bubble starts with no
+    Lake dependency mirrors, and Lake's own fetch of them is refused by the repo-scoped auth proxy.
+    """
+    meta = fetch_pr_metadata(t)
+    if not meta:
+        return False
+    head_ref, head_repo, clone_url = meta
+    try:
+        fetch_pr_head_branch(t.org_repo, t.ref, clone_url, head_ref)
+    except subprocess.CalledProcessError:
+        return False
+    click.echo(f"  refs/pull/{t.ref}/head is missing; fetched {head_repo}:{head_ref} in its place.")
+    return True
+
+
 def _resolve_ref_source(t, no_clone: bool) -> tuple[Path, str]:
     """Resolve the git reference source (bare repo or local .git).
 
@@ -259,7 +278,10 @@ def _resolve_ref_source(t, no_clone: bool) -> tuple[Path, str]:
             try:
                 fetch_ref(t.org_repo, f"refs/pull/{t.ref}/head:refs/pull/{t.ref}/head")
             except subprocess.CalledProcessError:
-                click.echo("  Warning: could not prefetch PR ref; continuing with normal clone.")
+                if not _fetch_pr_head_branch(t):
+                    click.echo(
+                        "  Warning: could not prefetch PR ref; continuing with normal clone."
+                    )
         else:
             # Refresh the branch / default-branch ref so language and toolchain
             # detection reads the current commit rather than a stale mirror
