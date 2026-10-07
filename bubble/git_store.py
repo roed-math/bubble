@@ -297,6 +297,29 @@ def fetch_ref(org_repo: str, ref: str):
         )
 
 
+def fetch_pr_head_branch(org_repo: str, pr_number: str, clone_url: str, head_ref: str) -> None:
+    """Fetch a PR's head branch from its head repository into the mirror's ``refs/pull/N/head``.
+
+    GitHub occasionally never creates ``refs/pull/N/head`` on the base repository, leaving only
+    ``refs/pull/N/merge`` (seen on TauCetiProject/TauCeti#11891). Detection reads that ref, so this
+    stands in for it when :func:`fetch_ref` cannot.
+    """
+    path = bare_repo_path(org_repo)
+    with _repo_lock(org_repo):
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "fetch",
+                "--",
+                clone_url,
+                f"+refs/heads/{head_ref}:refs/pull/{pr_number}/head",
+            ],
+            check=True,
+        )
+
+
 def refresh_mirror_ref(org_repo: str, kind: str, ref: str) -> None:
     """Refresh the bare-mirror ref used for language/toolchain detection.
 
